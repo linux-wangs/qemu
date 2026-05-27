@@ -20,10 +20,14 @@ struct VCoreState {
 };
 
 enum {
-    VCORE_MROM,
+    VCORE_MROM = 0,
     VCORE_CLINT,
-    VCORE_UART,
-    VCORE_DRAM
+    VCORE_UART_NS16550,
+    VCORE_UART_UARTLITE,
+    VCORE_ETH_AXI,
+    VCORE_ETH_AXI_DMA,
+    VCORE_ETH_DWMAC,
+    VCORE_DRAM,
 };
 
 #endif

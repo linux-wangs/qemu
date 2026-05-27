@@ -127,6 +127,9 @@ config VCORE
     select DEVICE_TREE
     select RISCV_ACLINT
     select SERIAL_MM
+    select XILINX
+    select XILINX_AXI
+    select UNIMP
 
 config XIANGSHAN_KUNMINGHU
     bool

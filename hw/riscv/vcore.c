@@ -10,19 +10,33 @@
 #include "hw/riscv/boot.h"
 #include "hw/char/serial.h"
 #include "hw/char/serial-mm.h"
+#include "hw/char/xilinx_uartlite.h"
 #include "hw/intc/riscv_aclint.h"
 #include "chardev/char.h"
 #include "system/device_tree.h"
 #include "system/system.h"
+#include "net/net.h"
+#include "hw/misc/unimp.h"
 
 #include <libfdt.h>
 
 static const MemMapEntry vcore_memmap[] = {
-    [VCORE_MROM] =     {     0x1000,     0xf000 },
-    [VCORE_CLINT] =    {  0x2000000,    0x10000 },
-    [VCORE_UART] =     {  0x10000000,   0x1000 },
-    [VCORE_DRAM] =     { 0x80000000,        0x0 },
+    [VCORE_MROM] =          {     0x1000,     0xf000 },
+    [VCORE_CLINT] =         {  0x2000000,    0x10000 },
+    [VCORE_UART_NS16550] =  {  0x30009000,   0x1000 },
+    [VCORE_UART_UARTLITE] = {  0x40600000,   0x1000 },
+    [VCORE_ETH_AXI] =       {  0x40c00000,  0x10000 },
+    [VCORE_ETH_AXI_DMA] =   {  0x41e00000,  0x10000 },
+    [VCORE_ETH_DWMAC] =     {  0x310a0000,  0x10000 },
+    [VCORE_DRAM] =          { 0x80000000,        0x0 },
 };
+
+#define UART_NS16550_IRQ 1
+#define UART_UARTLITE_IRQ 2
+#define ETH_AXI_IRQ 3
+#define ETH_AXI_DMA_IRQ0 4
+#define ETH_AXI_DMA_IRQ1 5
+#define ETH_DWMAC_IRQ 6
 
 static void create_fdt(VCoreState *s, const MemMapEntry *memmap, bool is_32_bit)
 {
@@ -123,17 +137,26 @@ static void create_fdt(VCoreState *s, const MemMapEntry *memmap, bool is_32_bit)
     g_free(clint_name);
     g_free(clint_cells);
 
-    uart_name = g_strdup_printf("/soc/uart@%lx", (long)memmap[VCORE_UART].base);
+    uart_name = g_strdup_printf("/soc/uart@%lx", (long)memmap[VCORE_UART_NS16550].base);
     qemu_fdt_add_subnode(fdt, uart_name);
     qemu_fdt_setprop_string(fdt, uart_name, "compatible", "ns16550a");
     qemu_fdt_setprop_cells(fdt, uart_name, "reg",
-        0x0, memmap[VCORE_UART].base, 0x0, memmap[VCORE_UART].size);
+        0x0, memmap[VCORE_UART_NS16550].base, 0x0, memmap[VCORE_UART_NS16550].size);
+    qemu_fdt_setprop_cell(fdt, uart_name, "clock-frequency", 115200);
+    qemu_fdt_setprop_string(fdt, uart_name, "status", "okay");
+    g_free(uart_name);
+
+    uart_name = g_strdup_printf("/soc/uartlite@%lx", (long)memmap[VCORE_UART_UARTLITE].base);
+    qemu_fdt_add_subnode(fdt, uart_name);
+    qemu_fdt_setprop_string(fdt, uart_name, "compatible", "xlnx,xps-uartlite-1.00.a");
+    qemu_fdt_setprop_cells(fdt, uart_name, "reg",
+        0x0, memmap[VCORE_UART_UARTLITE].base, 0x0, memmap[VCORE_UART_UARTLITE].size);
     qemu_fdt_setprop_cell(fdt, uart_name, "clock-frequency", 115200);
     qemu_fdt_setprop_string(fdt, uart_name, "status", "okay");
     g_free(uart_name);
 
     qemu_fdt_add_subnode(fdt, "/chosen");
-    qemu_fdt_setprop_string(fdt, "/chosen", "stdout-path", uart_name);
+    qemu_fdt_setprop_string(fdt, "/chosen", "stdout-path", "/soc/uart@30009000");
 }
 
 static void vcore_board_init(MachineState *machine)
@@ -150,6 +173,8 @@ static void vcore_board_init(MachineState *machine)
     uint64_t kernel_entry;
     int i, base_hartid = 0, hart_count = 1;
     RISCVBootInfo boot_info;
+    DeviceState *dev, *eth0, *dma;
+    Object *ds, *cs;
 
     for (i = 0; i < VCORE_SOCKETS_MAX; i++) {
         hart_count = machine->smp.cpus;
@@ -183,10 +208,63 @@ static void vcore_board_init(MachineState *machine)
     memory_region_add_subregion(system_memory, memmap[VCORE_MROM].base,
                                 mask_rom);
 
-    serial_mm_init(system_memory, memmap[VCORE_UART].base, 0,
+    serial_mm_init(system_memory, memmap[VCORE_UART_NS16550].base, 0,
                    qdev_get_gpio_in(DEVICE(&s->soc[0].harts[0]),
                                     IRQ_M_EXT),
                    115200, serial_hd(0), DEVICE_LITTLE_ENDIAN);
+
+    dev = qdev_new(TYPE_XILINX_UARTLITE);
+    qdev_prop_set_enum(dev, "endianness", ENDIAN_MODE_LITTLE);
+    qdev_prop_set_chr(dev, "chardev", serial_hd(1));
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, memmap[VCORE_UART_UARTLITE].base);
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                       qdev_get_gpio_in(DEVICE(&s->soc[0].harts[0]),
+                                        IRQ_M_EXT));
+
+    eth0 = qdev_new("xlnx.axi-ethernet");
+    dma = qdev_new("xlnx.axi-dma");
+
+    object_property_add_child(qdev_get_machine(), "xilinx-eth", OBJECT(eth0));
+    object_property_add_child(qdev_get_machine(), "xilinx-dma", OBJECT(dma));
+
+    ds = object_property_get_link(OBJECT(dma),
+                                  "axistream-connected-target", NULL);
+    cs = object_property_get_link(OBJECT(dma),
+                                  "axistream-control-connected-target", NULL);
+    qemu_configure_nic_device(eth0, true, NULL);
+    qdev_prop_set_uint32(eth0, "rxmem", 0x1000);
+    qdev_prop_set_uint32(eth0, "txmem", 0x1000);
+    object_property_set_link(OBJECT(eth0), "axistream-connected", ds,
+                             &error_abort);
+    object_property_set_link(OBJECT(eth0), "axistream-control-connected", cs,
+                             &error_abort);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(eth0), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(eth0), 0, memmap[VCORE_ETH_AXI].base);
+    sysbus_connect_irq(SYS_BUS_DEVICE(eth0), 0,
+                       qdev_get_gpio_in(DEVICE(&s->soc[0].harts[0]),
+                                        IRQ_M_EXT));
+
+    ds = object_property_get_link(OBJECT(eth0),
+                                  "axistream-connected-target", NULL);
+    cs = object_property_get_link(OBJECT(eth0),
+                                  "axistream-control-connected-target", NULL);
+    qdev_prop_set_uint32(dma, "freqhz", 100000000);
+    object_property_set_link(OBJECT(dma), "axistream-connected", ds,
+                             &error_abort);
+    object_property_set_link(OBJECT(dma), "axistream-control-connected", cs,
+                             &error_abort);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(dma), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(dma), 0, memmap[VCORE_ETH_AXI_DMA].base);
+    sysbus_connect_irq(SYS_BUS_DEVICE(dma), 0,
+                       qdev_get_gpio_in(DEVICE(&s->soc[0].harts[0]),
+                                        IRQ_M_EXT));
+    sysbus_connect_irq(SYS_BUS_DEVICE(dma), 1,
+                       qdev_get_gpio_in(DEVICE(&s->soc[0].harts[0]),
+                                        IRQ_M_EXT));
+
+    create_unimplemented_device("dwmac", memmap[VCORE_ETH_DWMAC].base,
+                                memmap[VCORE_ETH_DWMAC].size);
 
     firmware_name = riscv_find_firmware(machine->firmware,
                         riscv_default_firmware_name(&s->soc[0]));
