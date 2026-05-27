@@ -120,6 +120,14 @@ config SPIKE
     select RISCV_ACLINT
     select SIFIVE_PLIC
 
+config VCORE
+    bool
+    default y
+    depends on RISCV32 || RISCV64
+    select DEVICE_TREE
+    select RISCV_ACLINT
+    select SERIAL_MM
+
 config XIANGSHAN_KUNMINGHU
     bool
     default y
